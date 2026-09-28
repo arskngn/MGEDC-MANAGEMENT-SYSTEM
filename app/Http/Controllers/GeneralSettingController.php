@@ -1,0 +1,133 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\GeneralSetting;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Auth;
+
+class GeneralSettingController extends Controller
+{
+    public function index()
+    {
+        $setting = GeneralSetting::first();
+        $currencies = [
+            'PHP' => '₱',
+            'USD' => '$',
+            'EUR' => '€',
+            'GBP' => '£',
+            'JPY' => '¥',
+            'CNY' => '¥',
+            'INR' => '₹',
+            'AUD' => '$',
+            'CAD' => '$',
+            'SGD' => '$',
+            'HKD' => '$',
+        ];
+        $timezones = \DateTimeZone::listIdentifiers();
+
+        return view('settings.general', compact('setting', 'currencies', 'timezones'));
+    }
+
+    public function logoFavicon()
+    {
+        $user = Auth::user();
+        if (!$user instanceof \App\Models\User || !$user->hasRole('admin')) {
+            abort(403, 'Unauthorized action.');
+        }
+        $setting = GeneralSetting::first();
+
+        return view('settings.logo-favicon', compact('setting'));
+    }
+
+    public function updateLogoFavicon(Request $request)
+    {
+        $user = Auth::user();
+        if (!$user instanceof \App\Models\User || !$user->hasRole('admin')) {
+            abort(403, 'Unauthorized action.');
+        }
+        $request->validate([
+            'logo_light' => 'nullable|image|mimes:png,jpg,jpeg|max:2048',
+            'logo_dark' => 'nullable|image|mimes:png,jpg,jpeg|max:2048',
+            'favicon' => 'nullable|image|mimes:png,jpg,jpeg|max:2048',
+        ]);
+
+        $setting = GeneralSetting::first();
+        $path = public_path('system-images');
+
+        if (! File::isDirectory($path)) {
+            File::makeDirectory($path, 0777, true, true);
+        }
+
+        if ($request->hasFile('logo_light')) {
+            // Delete old file if exists
+            if ($setting->logo_light && File::exists(public_path($setting->logo_light))) {
+                File::delete(public_path($setting->logo_light));
+            }
+            $filename = 'logo_light_'.time().'.'.$request->logo_light->extension();
+            $request->logo_light->move($path, $filename);
+            $setting->logo_light = 'system-images/'.$filename;
+        }
+
+        if ($request->hasFile('logo_dark')) {
+            if ($setting->logo_dark && File::exists(public_path($setting->logo_dark))) {
+                File::delete(public_path($setting->logo_dark));
+            }
+            $filename = 'logo_dark_'.time().'.'.$request->logo_dark->extension();
+            $request->logo_dark->move($path, $filename);
+            $setting->logo_dark = 'system-images/'.$filename;
+        }
+
+        if ($request->hasFile('favicon')) {
+            if ($setting->favicon && File::exists(public_path($setting->favicon))) {
+                File::delete(public_path($setting->favicon));
+            }
+            $filename = 'favicon_'.time().'.'.$request->favicon->extension();
+            $request->favicon->move($path, $filename);
+            $setting->favicon = 'system-images/'.$filename;
+        }
+
+        $setting->save();
+
+        return back()->with('success', 'Logo & Favicon updated successfully.');
+    }
+
+    public function update(Request $request)
+    {
+        $rules = [
+            'timezone' => 'required|string',
+            'records_per_page' => 'required|integer|min:1',
+            'currency_format' => 'required|in:both,text,symbol',
+            'notification_retention_days' => 'nullable|integer|min:1|max:365',
+            'default_theme' => 'required|in:light,dark',
+        ];
+
+        $user = Auth::user();
+        $isAdmin = $user instanceof \App\Models\User && $user->hasRole('admin');
+
+        // Only admins can update these fields
+        if ($isAdmin) {
+            $rules['site_title'] = 'required|string|max:255';
+            $rules['whole_company_name'] = 'nullable|string|max:255';
+            $rules['currency'] = 'required|string|max:10';
+            $rules['currency_symbol'] = 'required|string|max:10';
+        }
+
+        $request->validate($rules);
+
+        $setting = GeneralSetting::first();
+
+        $data = $request->all();
+        if (!$isAdmin) {
+            unset($data['site_title']);
+            unset($data['whole_company_name']);
+            unset($data['currency']);
+            unset($data['currency_symbol']);
+        }
+
+        $setting->update($data);
+
+        return back()->with('success', 'General settings updated successfully.');
+    }
+}

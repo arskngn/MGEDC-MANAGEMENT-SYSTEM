@@ -1,0 +1,7 @@
+Batch ID: 1
+Batch Number: B-P-0000001-1-0234095133555
+quantity_available: 320
+quantity_damaged: 20
+Damaged returns count: 1
+  - SaleReturnItem ID: 5, Qty: 20.0000
+Purchase returns count: 0

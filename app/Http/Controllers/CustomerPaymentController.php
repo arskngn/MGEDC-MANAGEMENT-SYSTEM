@@ -1,0 +1,531 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Customer;
+use App\Models\GeneralSetting;
+use App\Models\Sale;
+use App\Models\SalePayment;
+use App\Models\SaleReturn;
+use App\Models\SaleReturnPayment;
+use App\Services\PdfService;
+use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Illuminate\Support\Facades\DB;
+use Illuminate\View\View;
+
+class CustomerPaymentController extends Controller
+{
+    public function index(Customer $customer): View
+    {
+        $receivableSales = Sale::query()
+            ->where('customer_id', $customer->id)
+            ->whereRaw('receivable_amount - paid_amount > 0.009')
+            ->orderByDesc('sale_date')
+            ->orderByDesc('id')
+            ->get();
+
+        $receivableTotal = (float) $receivableSales->sum(fn (Sale $s) => (float) $s->due_amount);
+
+        // Use DB query to avoid IDE/type-analysis issues while scaffolding this module.
+        $payableReturns = DB::table('sale_returns')
+            ->join('sales', 'sales.id', '=', 'sale_returns.sale_id')
+            ->select([
+                'sale_returns.id',
+                'sale_returns.return_invoice_no',
+                'sale_returns.return_date',
+                'sale_returns.payable_amount',
+                'sale_returns.paid_amount',
+                'sale_returns.created_at',
+            ])
+            ->where('sales.customer_id', $customer->id)
+            ->whereRaw('sale_returns.payable_amount - sale_returns.paid_amount > 0.009')
+            ->orderByDesc('sale_returns.return_date')
+            ->orderByDesc('sale_returns.id')
+            ->get();
+
+        $payableTotal = (float) $payableReturns->sum(function ($r) {
+            return max(0, (float) $r->payable_amount - (float) $r->paid_amount);
+        });
+
+        $lines = collect();
+
+        foreach ($receivableSales as $s) {
+            $lines->push([
+                'reason' => 'Sale',
+                'invoice_no' => $s->invoice_no,
+                'amount' => (float) $s->due_amount,
+                'date' => $s->sale_date ? strtotime((string) $s->sale_date) : strtotime((string) $s->created_at),
+            ]);
+        }
+
+        foreach ($payableReturns as $r) {
+            $lines->push([
+                'reason' => 'Sale Return',
+                'invoice_no' => $r->return_invoice_no,
+                'amount' => max(0, (float) $r->payable_amount - (float) $r->paid_amount),
+                'date' => $r->return_date ? strtotime((string) $r->return_date) : strtotime((string) $r->created_at),
+            ]);
+        }
+
+        $lines = $lines->sortByDesc('date')->values()->all();
+
+        return view('customers.payments', [
+            'customer' => $customer,
+            'receivableTotal' => $receivableTotal,
+            'payableTotal' => $payableTotal,
+            'lines' => $lines,
+        ]);
+    }
+
+    public function clear(Request $request, Customer $customer)
+    {
+        $user = $request->user();
+
+        DB::transaction(function () use ($user, $customer) {
+            if ($user && $user->hasPermission('Store Customer Payment')) {
+                // Lock sales for update to prevent race conditions
+                $receivableSales = Sale::query()
+                    ->where('customer_id', $customer->id)
+                    ->whereRaw('receivable_amount - paid_amount > 0.009')
+                    ->lockForUpdate()
+                    ->get();
+
+                foreach ($receivableSales as $s) {
+                    $due = (float) $s->due_amount;
+                    if ($due <= 0.0001) {
+                        continue;
+                    }
+
+                    SalePayment::create([
+                        'sale_id' => $s->id,
+                        'user_id' => $user->id,
+                        'amount' => $due,
+                    ]);
+
+                    Sale::where('id', $s->id)->increment('paid_amount', $due);
+                }
+            }
+
+            if ($user && $user->hasPermission('Store Payable Payment Of Customer')) {
+                // Lock sale returns for update to prevent race conditions
+                $payableReturns = DB::table('sale_returns')
+                    ->join('sales', 'sales.id', '=', 'sale_returns.sale_id')
+                    ->select([
+                        'sale_returns.id',
+                        'sale_returns.payable_amount',
+                        'sale_returns.paid_amount',
+                    ])
+                    ->where('sales.customer_id', $customer->id)
+                    ->whereRaw('sale_returns.payable_amount - sale_returns.paid_amount > 0.009')
+                    ->lockForUpdate()
+                    ->get();
+
+                foreach ($payableReturns as $r) {
+                    $due = max(0, (float) $r->payable_amount - (float) $r->paid_amount);
+                    if ($due <= 0.0001) {
+                        continue;
+                    }
+
+                    SaleReturnPayment::create([
+                        'sale_return_id' => $r->id,
+                        'user_id' => $user->id,
+                        'amount' => $due,
+                        'paid_at' => now(),
+                    ]);
+
+                    DB::table('sale_returns')->where('id', $r->id)->increment('paid_amount', $due);
+                }
+            }
+        });
+
+        return redirect()->route('customers.payments.index', $customer)->with('success', 'Payments cleared successfully.');
+    }
+
+    public function allPayments(Request $request): View
+    {
+        $query = $request->input('search', '');
+        $filter = $request->input('filter', 'all');
+        $startDate = $request->input('date_from');
+        $endDate = $request->input('date_to');
+        $paymentMethod = $request->input('payment_method', 'all');
+
+        // Get Sale Payments (Received from customers)
+        $salePaymentsQuery = SalePayment::with(['sale.customer', 'user'])
+            ->when($query, function ($q, $search) {
+                $q->whereHas('sale.customer', function ($cq) use ($search) {
+                    $cq->where('name', 'like', "%{$search}%")
+                      ->orWhere('company_name', 'like', "%{$search}%")
+                      ->orWhere('email', 'like', "%{$search}%")
+                      ->orWhere('phone', 'like', "%{$search}%");
+                })->orWhereHas('sale', function ($sq) use ($search) {
+                    $sq->where('invoice_no', 'like', "%{$search}%");
+                });
+            })
+            ->when($startDate, function ($q, $date) {
+                $q->whereDate('created_at', '>=', $date);
+            })
+            ->when($endDate, function ($q, $date) {
+                $q->whereDate('created_at', '<=', $date);
+            })
+            ->when($paymentMethod !== 'all', function ($q) use ($paymentMethod) {
+                $q->where('payment_method', $paymentMethod);
+            });
+
+        // Only include sale payments if filter is 'all' or 'received_from_customer'
+        $salePayments = collect();
+        if ($filter === 'all' || $filter === 'received_from_customer') {
+            $salePayments = $salePaymentsQuery->get()->map(function ($payment) {
+                return [
+                    'id' => $payment->id,
+                    'invoice_no' => $payment->sale->invoice_no ?? 'N/A',
+                    'date' => $payment->created_at,
+                    'customer' => $payment->sale->customer,
+                    'trx' => 'REC-' . str_pad($payment->id, 6, '0', STR_PAD_LEFT),
+                    'reason' => 'Received From Customer',
+                    'amount' => (float) $payment->amount,
+                    'type' => 'receipt',
+                    'payment_method' => $payment->payment_method,
+                    'check_number' => $payment->check_number,
+                    'check_date' => $payment->check_date,
+                    'user' => $payment->user,
+                ];
+            });
+        }
+
+        // Get Sale Return Payments (Paid to customers)
+        $returnPaymentsQuery = SaleReturnPayment::with(['saleReturn.sale.customer', 'user'])
+            ->when($query, function ($q, $search) {
+                $q->whereHas('saleReturn.sale.customer', function ($cq) use ($search) {
+                    $cq->where('name', 'like', "%{$search}%")
+                      ->orWhere('company_name', 'like', "%{$search}%")
+                      ->orWhere('email', 'like', "%{$search}%")
+                      ->orWhere('phone', 'like', "%{$search}%");
+                })->orWhereHas('saleReturn', function ($sq) use ($search) {
+                    $sq->where('return_invoice_no', 'like', "%{$search}%");
+                });
+            })
+            ->when($startDate, function ($q, $date) {
+                $q->whereDate('paid_at', '>=', $date);
+            })
+            ->when($endDate, function ($q, $date) {
+                $q->whereDate('paid_at', '<=', $date);
+            })
+            ->when($paymentMethod !== 'all', function ($q) use ($paymentMethod) {
+                $q->where('payment_method', $paymentMethod);
+            });
+
+        // Only include return payments if filter is 'all' or 'paid_for_sale_return'
+        $returnPayments = collect();
+        if ($filter === 'all' || $filter === 'paid_for_sale_return') {
+            $returnPayments = $returnPaymentsQuery->get()->map(function ($payment) {
+                return [
+                    'id' => $payment->id,
+                    'invoice_no' => $payment->saleReturn->return_invoice_no ?? 'N/A',
+                    'date' => $payment->paid_at ?? $payment->created_at,
+                    'customer' => $payment->saleReturn->sale->customer,
+                    'trx' => 'PAY-' . str_pad($payment->id, 6, '0', STR_PAD_LEFT),
+                    'reason' => 'Paid For Sale Return',
+                    'amount' => (float) $payment->amount,
+                    'type' => 'payment',
+                    'payment_method' => $payment->payment_method,
+                    'check_number' => $payment->check_number,
+                    'check_date' => $payment->check_date,
+                    'user' => $payment->user,
+                ];
+            });
+        }
+
+        // Merge and sort
+        $allPayments = $salePayments->merge($returnPayments)
+            ->sortByDesc('date')
+            ->values();
+
+        return view('customer-payments.index', [
+            'payments' => $allPayments,
+            'search' => $query,
+            'filter' => $filter,
+            'startDate' => $startDate,
+            'endDate' => $endDate,
+            'paymentMethod' => $paymentMethod,
+        ]);
+    }
+
+    public function exportPdf(Request $request): Response
+    {
+        $query = $request->input('search', '');
+        $filter = $request->input('filter', 'all');
+        $startDate = $request->input('date_from');
+        $endDate = $request->input('date_to');
+        $paymentMethod = $request->input('payment_method', 'all');
+
+        // Get Sale Payments (Received from customers)
+        $salePaymentsQuery = SalePayment::with(['sale.customer', 'user'])
+            ->when($query, function ($q, $search) {
+                $q->whereHas('sale.customer', function ($cq) use ($search) {
+                    $cq->where('name', 'like', "%{$search}%")
+                      ->orWhere('company_name', 'like', "%{$search}%")
+                      ->orWhere('email', 'like', "%{$search}%")
+                      ->orWhere('phone', 'like', "%{$search}%");
+                })->orWhereHas('sale', function ($sq) use ($search) {
+                    $sq->where('invoice_no', 'like', "%{$search}%");
+                });
+            })
+            ->when($startDate, function ($q, $date) {
+                $q->whereDate('created_at', '>=', $date);
+            })
+            ->when($endDate, function ($q, $date) {
+                $q->whereDate('created_at', '<=', $date);
+            })
+            ->when($paymentMethod !== 'all', function ($q) use ($paymentMethod) {
+                $q->where('payment_method', $paymentMethod);
+            });
+
+        // Only include sale payments if filter is 'all' or 'received_from_customer'
+        $salePayments = collect();
+        if ($filter === 'all' || $filter === 'received_from_customer') {
+            $salePayments = $salePaymentsQuery->get()->map(function ($payment) {
+                return [
+                    'id' => $payment->id,
+                    'invoice_no' => $payment->sale->invoice_no ?? 'N/A',
+                    'date' => $payment->created_at,
+                    'customer' => $payment->sale->customer,
+                    'trx' => 'REC-' . str_pad($payment->id, 6, '0', STR_PAD_LEFT),
+                    'reason' => 'Received From Customer',
+                    'amount' => (float) $payment->amount,
+                    'type' => 'receipt',
+                    'payment_method' => $payment->payment_method,
+                    'check_number' => $payment->check_number,
+                    'check_date' => $payment->check_date,
+                    'user' => $payment->user,
+                ];
+            });
+        }
+
+        // Get Sale Return Payments (Paid to customers)
+        $returnPaymentsQuery = SaleReturnPayment::with(['saleReturn.sale.customer', 'user'])
+            ->when($query, function ($q, $search) {
+                $q->whereHas('saleReturn.sale.customer', function ($cq) use ($search) {
+                    $cq->where('name', 'like', "%{$search}%")
+                      ->orWhere('company_name', 'like', "%{$search}%")
+                      ->orWhere('email', 'like', "%{$search}%")
+                      ->orWhere('phone', 'like', "%{$search}%");
+                })->orWhereHas('saleReturn', function ($sq) use ($search) {
+                    $sq->where('return_invoice_no', 'like', "%{$search}%");
+                });
+            })
+            ->when($startDate, function ($q, $date) {
+                $q->whereDate('paid_at', '>=', $date);
+            })
+            ->when($endDate, function ($q, $date) {
+                $q->whereDate('paid_at', '<=', $date);
+            })
+            ->when($paymentMethod !== 'all', function ($q) use ($paymentMethod) {
+                $q->where('payment_method', $paymentMethod);
+            });
+
+        // Only include return payments if filter is 'all' or 'paid_for_sale_return'
+        $returnPayments = collect();
+        if ($filter === 'all' || $filter === 'paid_for_sale_return') {
+            $returnPayments = $returnPaymentsQuery->get()->map(function ($payment) {
+                return [
+                    'id' => $payment->id,
+                    'invoice_no' => $payment->saleReturn->return_invoice_no ?? 'N/A',
+                    'date' => $payment->paid_at ?? $payment->created_at,
+                    'customer' => $payment->saleReturn->sale->customer,
+                    'trx' => 'PAY-' . str_pad($payment->id, 6, '0', STR_PAD_LEFT),
+                    'reason' => 'Paid For Sale Return',
+                    'amount' => (float) $payment->amount,
+                    'type' => 'payment',
+                    'payment_method' => $payment->payment_method,
+                    'check_number' => $payment->check_number,
+                    'check_date' => $payment->check_date,
+                    'user' => $payment->user,
+                ];
+            });
+        }
+
+        // Merge and sort
+        $allPayments = $salePayments->merge($returnPayments)
+            ->sortByDesc('date')
+            ->values();
+
+        if ($request->filled('trx')) {
+            $selectedTrx = array_filter(explode(',', $request->input('trx')));
+            $allPayments = $allPayments->whereIn('trx', $selectedTrx)->values();
+        } elseif ($request->filled('ids')) {
+            $selectedIds = array_filter(explode(',', $request->input('ids')));
+            $allPayments = $allPayments->whereIn('id', $selectedIds)->values();
+        }
+
+        $totalReceived = (float) $allPayments->where('type', 'receipt')->sum('amount');
+        $totalRefunded = (float) $allPayments->where('type', 'payment')->sum('amount');
+        $netTotal = $totalReceived - $totalRefunded;
+
+        $kpis = [
+            'total_count' => $allPayments->count(),
+            'total_received' => $totalReceived,
+            'total_refunded' => $totalRefunded,
+            'net_total' => $netTotal,
+        ];
+
+        $generalSetting = GeneralSetting::first();
+
+        $pdfService = app(PdfService::class);
+        $data = [
+            'payments' => $allPayments,
+            'kpis' => $kpis,
+            'search' => $query,
+            'filter' => $filter,
+            'startDate' => $startDate,
+            'endDate' => $endDate,
+            'paymentMethod' => $paymentMethod,
+            'generalSetting' => $generalSetting,
+            'logoSrc' => $pdfService->logoDataUri($generalSetting),
+        ];
+        $filename = 'customer-payments-' . date('Y-m-d') . '.pdf';
+
+        if ($request->has('print')) {
+            return $pdfService->stream('customer-payments.pdf', $data, $filename, 'landscape');
+        }
+
+        return $pdfService->download('customer-payments.pdf', $data, $filename, 'landscape');
+    }
+
+
+
+    public function exportCsv(Request $request): Response
+    {
+        $query = $request->input('search', '');
+        $filter = $request->input('filter', 'all');
+        $startDate = $request->input('date_from');
+        $endDate = $request->input('date_to');
+        $paymentMethod = $request->input('payment_method', 'all');
+
+        // Get Sale Payments (Received from customers)
+        $salePaymentsQuery = SalePayment::with(['sale.customer', 'user'])
+            ->when($query, function ($q, $search) {
+                $q->whereHas('sale.customer', function ($cq) use ($search) {
+                    $cq->where('name', 'like', "%{$search}%")
+                      ->orWhere('company_name', 'like', "%{$search}%")
+                      ->orWhere('email', 'like', "%{$search}%")
+                      ->orWhere('phone', 'like', "%{$search}%");
+                })->orWhereHas('sale', function ($sq) use ($search) {
+                    $sq->where('invoice_no', 'like', "%{$search}%");
+                });
+            })
+            ->when($startDate, function ($q, $date) {
+                $q->whereDate('created_at', '>=', $date);
+            })
+            ->when($endDate, function ($q, $date) {
+                $q->whereDate('created_at', '<=', $date);
+            })
+            ->when($paymentMethod !== 'all', function ($q) use ($paymentMethod) {
+                $q->where('payment_method', $paymentMethod);
+            });
+
+        // Only include sale payments if filter is 'all' or 'received_from_customer'
+        $salePayments = collect();
+        if ($filter === 'all' || $filter === 'received_from_customer') {
+            $salePayments = $salePaymentsQuery->get()->map(function ($payment) {
+                return [
+                    'id' => $payment->id,
+                    'invoice_no' => $payment->sale->invoice_no ?? 'N/A',
+                    'date' => $payment->created_at,
+                    'customer' => $payment->sale->customer,
+                    'trx' => 'REC-' . str_pad($payment->id, 6, '0', STR_PAD_LEFT),
+                    'reason' => 'Received From Customer',
+                    'amount' => (float) $payment->amount,
+                    'type' => 'receipt',
+                    'payment_method' => $payment->payment_method,
+                    'check_number' => $payment->check_number,
+                    'check_date' => $payment->check_date,
+                    'user' => $payment->user,
+                ];
+            });
+        }
+
+        // Get Sale Return Payments (Paid to customers)
+        $returnPaymentsQuery = SaleReturnPayment::with(['saleReturn.sale.customer', 'user'])
+            ->when($query, function ($q, $search) {
+                $q->whereHas('saleReturn.sale.customer', function ($cq) use ($search) {
+                    $cq->where('name', 'like', "%{$search}%")
+                      ->orWhere('company_name', 'like', "%{$search}%")
+                      ->orWhere('email', 'like', "%{$search}%")
+                      ->orWhere('phone', 'like', "%{$search}%");
+                })->orWhereHas('saleReturn', function ($sq) use ($search) {
+                    $sq->where('return_invoice_no', 'like', "%{$search}%");
+                });
+            })
+            ->when($startDate, function ($q, $date) {
+                $q->whereDate('paid_at', '>=', $date);
+            })
+            ->when($endDate, function ($q, $date) {
+                $q->whereDate('paid_at', '<=', $date);
+            })
+            ->when($paymentMethod !== 'all', function ($q) use ($paymentMethod) {
+                $q->where('payment_method', $paymentMethod);
+            });
+
+        // Only include return payments if filter is 'all' or 'paid_for_sale_return'
+        $returnPayments = collect();
+        if ($filter === 'all' || $filter === 'paid_for_sale_return') {
+            $returnPayments = $returnPaymentsQuery->get()->map(function ($payment) {
+                return [
+                    'id' => $payment->id,
+                    'invoice_no' => $payment->saleReturn->return_invoice_no ?? 'N/A',
+                    'date' => $payment->paid_at ?? $payment->created_at,
+                    'customer' => $payment->saleReturn->sale->customer,
+                    'trx' => 'PAY-' . str_pad($payment->id, 6, '0', STR_PAD_LEFT),
+                    'reason' => 'Paid For Sale Return',
+                    'amount' => (float) $payment->amount,
+                    'type' => 'payment',
+                    'payment_method' => $payment->payment_method,
+                    'check_number' => $payment->check_number,
+                    'check_date' => $payment->check_date,
+                    'user' => $payment->user,
+                ];
+            });
+        }
+
+        // Merge and sort
+        $allPayments = $salePayments->merge($returnPayments)
+            ->sortByDesc('date')
+            ->values();
+
+        $filename = 'customer-payments-' . date('Y-m-d') . '.csv';
+        
+        $headers = [
+            'Content-Type' => 'text/csv',
+            'Content-Disposition' => "attachment; filename=\"$filename\"",
+        ];
+
+        $callback = function () use ($allPayments) {
+            $file = fopen('php://output', 'w');
+            
+            // CSV Header
+            fputcsv($file, ['S.N.', 'Invoice No.', 'Date', 'Customer', 'TRX', 'Payment Method', 'Check Number', 'Check Date', 'Reason', 'Amount']);
+            
+            // CSV Data
+            foreach ($allPayments as $index => $payment) {
+                fputcsv($file, [
+                    $index + 1,
+                    $payment['invoice_no'],
+                    $payment['date']->format('Y-m-d'),
+                    $payment['customer']->name ?? 'N/A',
+                    $payment['trx'],
+                    $payment['payment_method'] ?? 'N/A',
+                    $payment['check_number'] ?? 'N/A',
+                    $payment['check_date'] ? $payment['check_date']->format('Y-m-d') : 'N/A',
+                    $payment['reason'],
+                    formatCurrency($payment['amount'])
+                ]);
+            }
+            
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
+}
+

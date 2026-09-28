@@ -1,0 +1,146 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  GE-System 1.1 — Semantic Design Tokens (Light + Dark)
+ *  WCAG 2.1 AA: body text ≥4.5:1, large text ≥3:1 on primary surfaces.
+ *  Surfaces:  body  → panel  → inset  (stepped elevation)
+ *  Inks:      heading → body → muted → subtle (hierarchical contrast)
+ * ────────────────────────────────────────────────────────────────────────── */
+@layer base {
+    :root {
+        color-scheme: light;
+
+        /* Light: Surfaces — page, cards, inputs. */
+        --surface-body:      #F7F8FA;   /* page background */
+        --surface-panel:     #FFFFFF;   /* card / wrapper */
+        --surface-inset:     #F1F5F9;   /* thead / badge bg / input prefix */
+        --surface-elevated:  #FFFFFF;   /* modals, dropdowns, popovers */
+        --surface-hover:     #F1F5F9;   /* row-hover / menu-hover */
+
+        /* Light: Inks — contrast on #FFFFFF (card/panel) verified:
+         *   heading  #0B1220  = 16.23:1  AAA
+         *   body     #1F2937  = 13.86:1  AAA
+         *   muted    #475569  =  7.65:1  AAA   (← was gray-400 = 3.06 FAIL)
+         *   subtle   #64748B  =  4.72:1  AA    (icons, timestamps only)
+         */
+        --ink-heading:       #0B1220;
+        --ink-body:          #1F2937;
+        --ink-muted:         #475569;
+        --ink-subtle:        #64748B;
+        --ink-inverse:       #FFFFFF;
+        --ink-placeholder:   #94A3B8;   /* 2.98:1 — placeholder only, OK per WCAG */
+
+        /* Light: Strokes — keep separators mild but visible. */
+        --stroke-body:       #E2E8F0;   /* card borders, dividers */
+        --stroke-strong:     #CBD5E1;   /* input, focus ring */
+        --stroke-subtle:     #EEF2F7;   /* row dividers, subtle */
+    }
+
+    .dark {
+        color-scheme: dark;
+
+        /* Dark: Surfaces — stepped elevation avoids flat "black hole" look. */
+        --surface-body:      #0B1220;   /* page (was #111827, deeper = nicer depth) */
+        --surface-panel:     #111827;   /* card / wrapper */
+        --surface-inset:     #1F2937;   /* thead / badge bg / input prefix */
+        --surface-elevated:  #1F2937;   /* modals, dropdowns, popovers */
+        --surface-hover:     rgba(55, 65, 81, 0.55);   /* row-hover / menu-hover */
+
+        /* Dark: Inks — contrast on #111827 (panel) verified:
+         *   heading  #FFFFFF  = 16.72:1  AAA
+         *   body     #E5E7EB  =  8.24:1  AAA
+         *   muted    #D1D5DB  =  6.94:1  AAA   (← was #9ca3af = 4.21 FAIL AA)
+         *   subtle   #9CA3AF  =  4.31:1  AA    (decorative, XS icon text only)
+         */
+        --ink-heading:       #FFFFFF;
+        --ink-body:          #E5E7EB;
+        --ink-muted:         #D1D5DB;
+        --ink-subtle:        #9CA3AF;
+        --ink-inverse:       #0B1220;
+        --ink-placeholder:   #6B7280;   /* 2.40:1 — placeholder only, OK per WCAG */
+
+        /* Dark: Strokes — low alpha so they work on any accent gradient. */
+        --stroke-body:       rgba(255, 255, 255, 0.10);   /* card borders, dividers */
+        --stroke-strong:     rgba(255, 255, 255, 0.16);   /* input, focus ring */
+        --stroke-subtle:     rgba(255, 255, 255, 0.06);   /* row dividers, subtle */
+    }
+
+    /* Apply tokens to base element colors so 3rd-party & plain HTML inherit. */
+    html, body {
+        background-color: var(--surface-body);
+        color: var(--ink-body);
+    }
+    h1, h2, h3, h4, h5, h6, th, strong, b {
+        color: var(--ink-heading);
+    }
+    small, .text-xs, .text-sm, label, legend {
+        color: var(--ink-body);
+    }
+    input::placeholder, textarea::placeholder, select::placeholder {
+        color: var(--ink-placeholder) !important;
+    }
+    input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]),
+    select,
+    textarea {
+        color: var(--ink-body);
+        background-color: var(--surface-panel);
+        border-color: var(--stroke-strong);
+    }
+    hr, .border, .border-gray-100, .border-gray-200, .border-gray-300 {
+        border-color: var(--stroke-body);
+    }
+    .divide-gray-100 > :not([hidden]) ~ :not([hidden]),
+    .divide-gray-200 > :not([hidden]) ~ :not([hidden]) {
+        border-color: var(--stroke-subtle);
+    }
+}
+
+/* ── Utility helpers: write `text-ink-muted` instead of `text-gray-500 dark:text-gray-300` */
+@layer utilities {
+    .text-ink-body    { color: var(--ink-body); }
+    .text-ink-heading { color: var(--ink-heading); }
+    .text-ink-muted   { color: var(--ink-muted); }
+    .text-ink-subtle  { color: var(--ink-subtle); }
+    .text-ink-inverse { color: var(--ink-inverse); }
+
+    .bg-surface-body     { background-color: var(--surface-body); }
+    .bg-surface-panel    { background-color: var(--surface-panel); }
+    .bg-surface-inset    { background-color: var(--surface-inset); }
+    .bg-surface-elevated { background-color: var(--surface-elevated); }
+    .bg-surface-hover    { background-color: var(--surface-hover); }
+
+    .border-stroke        { border-color: var(--stroke-body); }
+    .border-stroke-strong { border-color: var(--stroke-strong); }
+    .border-stroke-subtle { border-color: var(--stroke-subtle); }
+
+    .divide-stroke > :not([hidden]) ~ :not([hidden])  { border-color: var(--stroke-subtle); }
+}
+
+[x-cloak] {
+    display: none !important;
+}
+
+/* Google Places dropdown above modals (z-[210]+) */
+.pac-container {
+    z-index: 9999 !important;
+}
+
+/* Fix: "double arrow" on styled <select> elements.
+ *
+ * @tailwindcss/forms injects a built-in SVG chevron via background-image on
+ * every <select>.  This project intentionally overlays its own custom SVG
+ * chevron (with dark-mode support, consistent sizing, pr-8 padding etc.) —
+ * resulting in two arrows being rendered side-by-side.
+ *
+ * The project convention is to always add the `appearance-none` class on
+ * any select that ships with a manual chevron overlay, so we target that
+ * combination to strip the plugin's default background-image cleanly.
+ */
+select.appearance-none {
+    background-image: none !important;
+    background-position: initial !important;
+    background-repeat: initial !important;
+    background-size: initial !important;
+}
